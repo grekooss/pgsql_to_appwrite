@@ -1,5 +1,5 @@
-import { Client } from "@googlemaps/google-maps-services-js";
-import pg from "pg";
+import { Client, Databases, Query } from "node-appwrite";
+import { Client as GoogleMapsClient } from "@googlemaps/google-maps-services-js";
 import fetch from "node-fetch";
 import * as dotenv from "dotenv";
 import * as path from "path";
@@ -8,17 +8,16 @@ import * as fs from "fs/promises";
 // Załaduj zmienne środowiskowe
 dotenv.config();
 
-// Konfiguracja klienta PostgreSQL
-const pool = new pg.Pool({
-  user: process.env.PG_USER,
-  host: process.env.PG_HOST,
-  database: process.env.PG_DATABASE,
-  password: process.env.PG_PASSWORD,
-  port: process.env.PG_PORT,
-});
+// Inicjalizacja klienta Appwrite
+const appwrite = new Client()
+    .setEndpoint(process.env.APPWRITE_ENDPOINT)
+    .setProject(process.env.APPWRITE_PROJECT_ID)
+    .setKey(process.env.APPWRITE_API_KEY);
+
+const databases = new Databases(appwrite);
 
 // Inicjalizacja klienta Google Maps
-const googleMapsClient = new Client({});
+const googleMapsClient = new GoogleMapsClient({});
 
 async function getPlacesData(latitude, longitude, placeName) {
   try {
@@ -144,70 +143,66 @@ async function saveAttributions(placeData, osm_id) {
 
 async function main() {
   try {
-    console.log("Łączenie z bazą danych...");
-    const client = await pool.connect();
-    console.log("Połączono z bazą danych.");
-
-    console.log("Wykonywanie zapytania SQL...");
-    const result = await client.query(
-      `SELECT osm_id, 
-              ST_Y(ST_Transform(ST_Centroid(way), 4326)) as latitude,
-              ST_X(ST_Transform(ST_Centroid(way), 4326)) as longitude,
-              name
-       FROM planet_osm_polygon 
-       WHERE sport = 'soccer' 
-       AND name IS NOT NULL 
-       LIMIT 10`
+    // Pobierz wszystkie dokumenty z kolekcji landings
+    const response = await databases.listDocuments(
+      process.env.APPWRITE_DATABASE_ID,
+      process.env.APPWRITE_COLLECTION_ID,
+      [
+        Query.isNotNull('center_point')
+      ]
     );
 
-    console.log("Znaleziono", result.rows.length, "boisk piłkarskich:\n");
-
-    // Utwórz folder na zdjęcia jeśli nie istnieje
-    await fs.mkdir(path.join(process.cwd(), "processed_images"), {
-      recursive: true,
-    });
-
-    // Przetwórz każde boisko
-    for (const row of result.rows) {
-      console.log(
-        `- ${row.name} (${row.latitude}, ${row.longitude}) [OSM ID: ${row.osm_id}]`
-      );
-      console.log("Szukanie miejsca w Google Places...");
-      const placeData = await getPlacesData(
-        row.latitude,
-        row.longitude,
-        row.name
-      );
-
-      if (placeData && placeData.photos) {
-        // Zapisz informacje o atrybucji
-        await saveAttributions(placeData, row.osm_id);
-
-        // Pobierz maksymalnie 3 zdjęcia
-        const photosToDownload = placeData.photos.slice(0, 3);
-        for (let i = 0; i < photosToDownload.length; i++) {
-          const photo = photosToDownload[i];
-          const photoUrl = `https://maps.googleapis.com/maps/api/place/photo?maxwidth=1600&photo_reference=${
-            photo.photo_reference
-          }&key=${process.env.GOOGLE_MAPS_API_KEY}`;
-          const outputPath = path.join(
-            process.cwd(),
-            "processed_images",
-            `${row.osm_id}_${i + 1}.jpg`
-          );
+    for (const landing of response.documents) {
+      console.log(`Przetwarzanie landingu: ${landing.$id}`);
+      
+      // Parsuj współrzędne z center_point
+      try {
+        const coordinates = JSON.parse(landing.center_point);
+        const [latitude, longitude] = coordinates;
+        
+        // Pobierz dane o miejscu z Google Places API
+        const placeData = await getPlacesData(latitude, longitude, "");
+        
+        if (placeData && placeData.photos && placeData.photos.length > 0) {
+          const photo = placeData.photos[0];
+          const photoReference = photo.photo_reference;
+          
+          // Przygotuj ścieżkę do zapisu zdjęcia
+          const outputDir = path.join(process.cwd(), 'processed_images');
+          await fs.mkdir(outputDir, { recursive: true });
+          const outputPath = path.join(outputDir, `${landing.$id}.jpg`);
+          
+          // Pobierz i zapisz zdjęcie
+          const photoUrl = `https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photoreference=${photoReference}&key=${process.env.GOOGLE_MAPS_API_KEY}`;
           await downloadImage(photoUrl, outputPath);
+          
+          console.log(`Zapisano zdjęcie dla landingu ${landing.$id}`);
+          
+          // Zaktualizuj dokument w Appwrite z informacją o zdjęciu
+          await databases.updateDocument(
+            process.env.APPWRITE_DATABASE_ID,
+            process.env.APPWRITE_COLLECTION_ID,
+            landing.$id,
+            {
+              has_image: true,
+              place_name: placeData.name,
+              place_address: placeData.formatted_address,
+              place_rating: placeData.rating,
+              place_url: placeData.url
+            }
+          );
+        } else {
+          console.log(`Nie znaleziono zdjęć dla landingu ${landing.$id}`);
         }
-      } else {
-        console.log("Nie znaleziono zdjęć dla tego miejsca");
+      } catch (error) {
+        console.error(`Błąd podczas przetwarzania współrzędnych dla landingu ${landing.$id}:`, error);
+        continue;
       }
-      console.log("---\n");
     }
-
-    client.release();
+    
+    console.log('Zakończono przetwarzanie wszystkich landingów');
   } catch (error) {
-    console.error("Błąd:", error);
-  } finally {
-    await pool.end();
+    console.error('Wystąpił błąd podczas wykonywania skryptu:', error);
   }
 }
 

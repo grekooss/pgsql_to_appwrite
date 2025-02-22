@@ -1,5 +1,6 @@
 # Node.js
 node_modules/
+node_modules/
 npm-debug.log
 yarn-debug.log*
 yarn-error.log*
@@ -30,7 +31,6 @@ wheels/
 *.egg
 
 # Środowiska wirtualne
-.env
 .venv
 env/
 venv/
@@ -54,3 +54,12 @@ Thumbs.db
 # Pliki konfiguracyjne zawierające wrażliwe dane
 config.ini
 secrets.json
+
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+
+# Generated files
+processed_images/

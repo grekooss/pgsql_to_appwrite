@@ -1,60 +1,52 @@
-import { Client, Databases, Query } from "node-appwrite";
 import { Client as GoogleMapsClient } from "@googlemaps/google-maps-services-js";
-import fetch from "node-fetch";
 import * as dotenv from "dotenv";
+import * as fsPromises from "fs/promises";
+import { Client, Databases, InputFile, Query, Storage } from "node-appwrite";
+import fetch from "node-fetch";
+import * as os from "os";
 import * as path from "path";
-import * as fs from "fs/promises";
+import sharp from "sharp";
 
 // Załaduj zmienne środowiskowe
 dotenv.config();
 
 // Inicjalizacja klienta Appwrite
-const appwrite = new Client()
-    .setEndpoint(process.env.APPWRITE_ENDPOINT)
-    .setProject(process.env.APPWRITE_PROJECT_ID)
-    .setKey(process.env.APPWRITE_API_KEY);
+const client = new Client()
+  .setEndpoint(process.env.APPWRITE_ENDPOINT)
+  .setProject(process.env.APPWRITE_PROJECT_ID)
+  .setKey(process.env.APPWRITE_API_KEY);
 
-const databases = new Databases(appwrite);
+const databases = new Databases(client);
+const storage = new Storage(client);
 
 // Inicjalizacja klienta Google Maps
-const googleMapsClient = new GoogleMapsClient({});
+const googleMapsClient = new GoogleMapsClient({
+  config: {
+    params: {
+      key: process.env.GOOGLE_MAPS_API_KEY,
+    },
+  },
+});
 
 async function getPlacesData(latitude, longitude, placeName) {
   try {
     console.log("Używany klucz API:", process.env.GOOGLE_MAPS_API_KEY);
+    console.log("Szukam miejsca w lokalizacji:", {
+      lat: parseFloat(latitude),
+      lng: parseFloat(longitude),
+    });
 
-    // Lista typów miejsc do sprawdzenia
-    const placeTypes = [
-      "stadium", // stadion
-      "park", // park (może zawierać boiska)
-      "school", // szkoła (często ma boiska)
-      "gym", // siłownia/kompleks sportowy
-      "sports_complex", // kompleks sportowy
-    ];
+    const response = await googleMapsClient.placesNearby({
+      params: {
+        location: `${parseFloat(latitude)},${parseFloat(longitude)}`,
+        radius: 1000,
+      },
+      timeout: 5000,
+    });
 
-    let allResults = [];
-
-    // Wykonaj wyszukiwanie dla każdego typu miejsca
-    for (const type of placeTypes) {
-      const response = await googleMapsClient.placesNearby({
-        params: {
-          location: { lat: latitude, lng: longitude },
-          radius: 5,
-          keyword: `${placeName} boisko stadion soccer football`,
-          type: type,
-          key: process.env.GOOGLE_MAPS_API_KEY,
-        },
-        timeout: 5000,
-      });
-
-      if (response.data.results.length > 0) {
-        allResults = allResults.concat(response.data.results);
-      }
-    }
-
-    if (allResults.length > 0) {
+    if (response.data.results.length > 0) {
       // Sortuj wszystkie wyniki po odległości od podanych współrzędnych
-      const sortedResults = allResults.sort((a, b) => {
+      const sortedResults = response.data.results.sort((a, b) => {
         const distA = Math.sqrt(
           Math.pow(a.geometry.location.lat - latitude, 2) +
             Math.pow(a.geometry.location.lng - longitude, 2)
@@ -66,24 +58,21 @@ async function getPlacesData(latitude, longitude, placeName) {
         return distA - distB;
       });
 
-      // Usuń duplikaty na podstawie place_id
-      const uniqueResults = sortedResults.filter(
-        (result, index, self) =>
-          index === self.findIndex((t) => t.place_id === result.place_id)
-      );
-
-      const place = uniqueResults[0]; // Weź najbliższe miejsce
-      console.log(
-        "Znaleziono miejsce:",
-        place.name,
-        `(typ: ${place.types.join(", ")})`
-      );
+      const place = sortedResults[0]; // Weź najbliższe miejsce
+      console.log("Znaleziono miejsce:", place.name);
 
       const placeDetails = await googleMapsClient.placeDetails({
         params: {
           place_id: place.place_id,
-          fields: ["photos", "name", "formatted_address", "url", "website", "rating", "user_ratings_total"],
-          key: process.env.GOOGLE_MAPS_API_KEY,
+          fields: [
+            "photos",
+            "name",
+            "formatted_address",
+            "url",
+            "website",
+            "rating",
+            "user_ratings_total",
+          ],
         },
       });
 
@@ -96,14 +85,43 @@ async function getPlacesData(latitude, longitude, placeName) {
   }
 }
 
-async function downloadImage(url, outputPath) {
+async function downloadImage(url, osm_id, photoIndex) {
   try {
     const response = await fetch(url);
-    const buffer = await response.buffer();
-    await fs.writeFile(outputPath, buffer);
-    console.log("Zapisano zdjęcie:", outputPath);
+    const buffer = await response.arrayBuffer();
+    const filename = `${osm_id}_${photoIndex}`;
+
+    // Kompresja i zmiana rozmiaru zdjęcia
+    const compressedImage = await sharp(Buffer.from(buffer))
+      .resize(640, 480)
+      .jpeg({ quality: 60 })
+      .toBuffer();
+
+    console.log(
+      `Rozmiar zdjęcia po kompresji: ${compressedImage.length / 1024} KB`
+    );
+
+    // Zapisz bufor do pliku tymczasowego
+    const tempPath = path.join(os.tmpdir(), `temp_${filename}`);
+    await fsPromises.writeFile(tempPath, compressedImage);
+
+    // Utwórz InputFile z pliku tymczasowego
+    const file = InputFile.fromPath(tempPath, filename);
+
+    // Przesyłamy zdjęcie do Appwrite Storage
+    const result = await storage.createFile(
+      process.env.APPWRITE_BUCKET_ID,
+      filename,
+      file
+    );
+
+    // Usuń plik tymczasowy
+    await fsPromises.unlink(tempPath);
+
+    return result.$id;
   } catch (error) {
-    console.error("Błąd podczas pobierania zdjęcia:", error);
+    console.error("Błąd podczas pobierania/przesyłania zdjęcia:", error);
+    throw error;
   }
 }
 
@@ -122,87 +140,125 @@ async function saveAttributions(placeData, osm_id) {
       website: placeData.website || null,
       rating: placeData.rating || null,
       user_ratings_total: placeData.user_ratings_total || null,
-      photos: placeData.photos.map(photo => ({
+      photos: placeData.photos.map((photo) => ({
         photo_reference: photo.photo_reference,
         html_attributions: photo.html_attributions,
-        height: photo.height,
-        width: photo.width
-      }))
+      })),
     };
 
-    await fs.writeFile(
+    await fsPromises.writeFile(
       attributionsPath,
       JSON.stringify(attributions, null, 2),
       "utf8"
     );
-    console.log("Zapisano informacje o atrybucji:", attributionsPath);
   } catch (error) {
-    console.error("Błąd podczas zapisywania informacji o atrybucji:", error);
+    console.error("Błąd podczas zapisywania atrybutów:", error);
+  }
+}
+
+async function processPhotos(placeData, landing_id, landing) {
+  if (!placeData || !placeData.photos || placeData.photos.length === 0) {
+    console.log(`Nie znaleziono zdjęć dla landingu ${landing_id}`);
+    return;
+  }
+
+  try {
+    await saveAttributions(placeData, landing.osm_id);
+
+    // Ograniczamy liczbę zdjęć do 3
+    const photosToProcess = placeData.photos.slice(0, 3);
+
+    for (const [index, photo] of photosToProcess.entries()) {
+      // Numerujemy od 1
+      const photoNumber = index + 1;
+      const documentId = `${landing.osm_id}_${photoNumber}`;
+
+      try {
+        // Sprawdź czy dokument już istnieje
+        try {
+          await databases.getDocument(
+            process.env.APPWRITE_DATABASE_ID,
+            process.env.APPWRITE_PHOTOS_COLLECTION_ID,
+            documentId
+          );
+          console.log(
+            `Dokument ${documentId} już istnieje w kolekcji Photos, pomijam...`
+          );
+          continue;
+        } catch (error) {
+          // Jeśli dokument nie istnieje (404), kontynuujemy tworzenie
+          if (error.code !== 404) {
+            throw error;
+          }
+        }
+
+        const photoUrl = `https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photo_reference=${photo.photo_reference}&key=${process.env.GOOGLE_MAPS_API_KEY}`;
+        const fileId = await downloadImage(
+          photoUrl,
+          landing.osm_id,
+          photoNumber
+        );
+
+        // Utwórz dokument w kolekcji Photos
+        await databases.createDocument(
+          process.env.APPWRITE_DATABASE_ID,
+          process.env.APPWRITE_PHOTOS_COLLECTION_ID,
+          documentId,
+          {
+            landings_id: landing_id,
+            filename: fileId,
+            html_attributions: photo.html_attributions[0] || "",
+            google_maps_url: placeData.url || "",
+            width: 640,
+            height: 480,
+          }
+        );
+
+        console.log(
+          `Utworzono dokument ${documentId} w kolekcji Photos dla landingu ${landing_id}`
+        );
+      } catch (error) {
+        console.error(
+          `Błąd podczas przetwarzania zdjęcia ${photoNumber} dla landingu ${landing_id}:`,
+          error
+        );
+        if (error.response) {
+          console.error("Szczegóły błędu:", error.response);
+        }
+      }
+    }
+  } catch (error) {
+    console.error(
+      `Błąd podczas przetwarzania zdjęć dla landingu ${landing_id}:`,
+      error
+    );
+    if (error.response) {
+      console.error("Szczegóły błędu:", error.response);
+    }
   }
 }
 
 async function main() {
   try {
-    // Pobierz wszystkie dokumenty z kolekcji landings
-    const response = await databases.listDocuments(
+    const landings = await databases.listDocuments(
       process.env.APPWRITE_DATABASE_ID,
-      process.env.APPWRITE_COLLECTION_ID,
-      [
-        Query.isNotNull('center_point')
-      ]
+      process.env.APPWRITE_LANDINGS_COLLECTION_ID,
+      [Query.limit(100)]
     );
 
-    for (const landing of response.documents) {
-      console.log(`Przetwarzanie landingu: ${landing.$id}`);
-      
+    for (const landing of landings.documents) {
+      console.log("Przetwarzanie landingu:", landing.$id);
+      console.log("Dane landingu:", landing);
+
       // Parsuj współrzędne z center_point
-      try {
-        const coordinates = JSON.parse(landing.center_point);
-        const [latitude, longitude] = coordinates;
-        
-        // Pobierz dane o miejscu z Google Places API
-        const placeData = await getPlacesData(latitude, longitude, "");
-        
-        if (placeData && placeData.photos && placeData.photos.length > 0) {
-          const photo = placeData.photos[0];
-          const photoReference = photo.photo_reference;
-          
-          // Przygotuj ścieżkę do zapisu zdjęcia
-          const outputDir = path.join(process.cwd(), 'processed_images');
-          await fs.mkdir(outputDir, { recursive: true });
-          const outputPath = path.join(outputDir, `${landing.$id}.jpg`);
-          
-          // Pobierz i zapisz zdjęcie
-          const photoUrl = `https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photoreference=${photoReference}&key=${process.env.GOOGLE_MAPS_API_KEY}`;
-          await downloadImage(photoUrl, outputPath);
-          
-          console.log(`Zapisano zdjęcie dla landingu ${landing.$id}`);
-          
-          // Zaktualizuj dokument w Appwrite z informacją o zdjęciu
-          await databases.updateDocument(
-            process.env.APPWRITE_DATABASE_ID,
-            process.env.APPWRITE_COLLECTION_ID,
-            landing.$id,
-            {
-              has_image: true,
-              place_name: placeData.name,
-              place_address: placeData.formatted_address,
-              place_rating: placeData.rating,
-              place_url: placeData.url
-            }
-          );
-        } else {
-          console.log(`Nie znaleziono zdjęć dla landingu ${landing.$id}`);
-        }
-      } catch (error) {
-        console.error(`Błąd podczas przetwarzania współrzędnych dla landingu ${landing.$id}:`, error);
-        continue;
-      }
+      const coordinates = JSON.parse(landing.center_point);
+      const [latitude, longitude] = coordinates;
+
+      const placeData = await getPlacesData(latitude, longitude, landing.name);
+      await processPhotos(placeData, landing.$id, landing);
     }
-    
-    console.log('Zakończono przetwarzanie wszystkich landingów');
   } catch (error) {
-    console.error('Wystąpił błąd podczas wykonywania skryptu:', error);
+    console.error("Błąd podczas przetwarzania landingów:", error);
   }
 }
 
